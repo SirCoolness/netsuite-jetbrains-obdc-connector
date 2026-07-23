@@ -1,0 +1,7 @@
+out/
+.build/
+logs/
+*.log
+.idea/
+.cursor/
+connection-string.txt

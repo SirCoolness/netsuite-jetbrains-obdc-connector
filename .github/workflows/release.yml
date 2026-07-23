@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build fat JAR
+        run: ./build.sh
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/netsuite-jetbrains-driver.jar
+          generate_release_notes: true
