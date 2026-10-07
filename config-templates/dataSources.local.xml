@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Per-user data source settings (placeholders only). Goes in <project>/.idea/dataSources.local.xml.
+  User "TBA" is what NetSuite expects with token-based auth. The introspection scope covers only
+  the current schema ("@") of the current database, which keeps the (slow) first introspection
+  small. The driver reports the role's schema (the only one NetSuite exposes, e.g.
+  "Data Warehouse Integrator") as the current schema.
+-->
+<project version="4">
+  <component name="dataSourceStorageLocal">
+    <data-source name="NetSuite" uuid="__DATA_SOURCE_UUID__">
+      <user-name>TBA</user-name>
+      <schema-mapping>
+        <introspection-scope>
+          <node kind="database" qname="@">
+            <node kind="schema" qname="@" />
+          </node>
+        </introspection-scope>
+      </schema-mapping>
+    </data-source>
+  </component>
+</project>

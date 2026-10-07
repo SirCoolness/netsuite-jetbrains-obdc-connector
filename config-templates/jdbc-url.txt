@@ -1,0 +1,1 @@
+jdbc:ns://__ACCOUNT_HOST__.connect.api.netsuite.com:1708;ServerDataSource=NetSuite2.com;Encrypted=1;NegotiateSSLClose=false;CustomProperties=(AccountID=__ACCOUNT_ID__;RoleID=__ROLE_ID__;GenerateNonce=true)
