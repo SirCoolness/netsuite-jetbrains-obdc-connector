@@ -1,0 +1,22 @@
+<!--
+  JetBrains driver definition for the NetSuite TBA wrapper driver (placeholders only).
+
+  Rendered by helper-scripts/install-jetbrains-driver.sh. To use it, either create the
+  driver in the IDE as described in README.md, or (with the IDE closed) copy the <driver>
+  element into the LocalDatabaseDriverManager component of
+  <JetBrains config dir>/options/databaseDrivers.xml.
+
+  No dialect attribute on purpose: the data source must stay on the generic (auto-detected)
+  DBMS. The "NetSuite" dialect makes the IDE use its Oracle introspector, which fails with
+  DbmsMismatchException.
+-->
+<application>
+  <component name="LocalDatabaseDriverManager" version="201">
+    <driver id="netsuite-tba-wrapper" name="NetSuite (TBA wrapper)" driver-class="com.netsuite.jetbrains.NetsuiteJetbrainsDriver">
+      <option name="auto-commit" value="true" />
+      <library>
+        <url>file://__DRIVER_JAR__</url>
+      </library>
+    </driver>
+  </component>
+</application>
