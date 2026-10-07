@@ -1,0 +1,176 @@
+package com.netsuite.jetbrains;
+
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+/**
+ * Statement / PreparedStatement / CallableStatement proxy that:
+ * - returns the connection proxy from getConnection() and itself from ResultSet.getStatement(),
+ *   so JetBrains never reaches the raw OpenAccess connection (whose metadata reports
+ *   "OpenAccess" and would select the Oracle introspector);
+ * - retries a SELECT once on a fresh session when the connection expired. Statement settings
+ *   and bound parameters are recorded and replayed onto the re-created statement.
+ */
+final class StatementWrapper implements InvocationHandler {
+
+    /** A query starts with SELECT or WITH after leading whitespace, comments and parentheses. */
+    private static final Pattern QUERY = Pattern.compile(
+        "^(?:\\s|\\(|--[^\\n]*(?:\\n|$)|/\\*.*?\\*/)*(?:select|with)\\b",
+        Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+    private static final String PARAMETER_KEY = "param:";
+
+    private final ConnectionWrapper owner;
+    private final Method factory;
+    private final Object[] factoryArgs;
+    /** SQL bound at prepare time, null for a plain Statement. */
+    private final String preparedSql;
+    private final Map<String, Object[]> settings = new LinkedHashMap<String, Object[]>();
+    private final Map<String, Method> settingMethods = new LinkedHashMap<String, Method>();
+    private Statement real;
+    private int generation;
+    private Statement proxy;
+
+    private StatementWrapper(ConnectionWrapper owner, Method factory, Object[] factoryArgs, Statement real, int generation) {
+        this.owner = owner;
+        this.factory = factory;
+        this.factoryArgs = factoryArgs;
+        this.preparedSql = factoryArgs != null && factoryArgs.length > 0 && factoryArgs[0] instanceof String
+            ? (String) factoryArgs[0] : null;
+        this.real = real;
+        this.generation = generation;
+    }
+
+    static Statement wrap(ConnectionWrapper owner, Method factory, Object[] args) throws Throwable {
+        int generation = owner.generation();
+        Statement real = (Statement) Proxies.invoke(owner.real(), factory, args);
+        StatementWrapper handler = new StatementWrapper(owner, factory, args, real, generation);
+        handler.proxy = Proxies.create(real, Statement.class, handler);
+        return handler.proxy;
+    }
+
+    static boolean isQuery(String sql) {
+        return sql != null && QUERY.matcher(sql).find();
+    }
+
+    public Object invoke(Object proxyRef, Method method, Object[] args) throws Throwable {
+        String name = method.getName();
+        JdbcLogger.log("Statement", name, args);
+        try {
+            Object common = Proxies.common(proxyRef, method, args, () -> real);
+            if (common != Proxies.UNHANDLED) {
+                return common;
+            }
+            if ("getConnection".equals(name)) {
+                return owner.proxy();
+            }
+            // JDBC 4.2 "large" variants the JDBC 4.0 driver lacks (the JDK defaults throw)
+            if ("setLargeMaxRows".equals(name)) {
+                return invoke(proxyRef, "setMaxRows", int.class, (int) Math.min((Long) args[0], Integer.MAX_VALUE));
+            }
+            if ("getLargeMaxRows".equals(name) || "getLargeUpdateCount".equals(name)) {
+                String intVariant = "getLargeMaxRows".equals(name) ? "getMaxRows" : "getUpdateCount";
+                return ((Integer) invoke(proxyRef, intVariant, null, null)).longValue();
+            }
+            if ("close".equals(name) || "isClosed".equals(name)) {
+                return Proxies.invoke(real, method, args);
+            }
+            if (name.startsWith("execute")) {
+                String sql = Proxies.isNoArg(args) ? preparedSql : args[0] instanceof String ? (String) args[0] : null;
+                if (isRetryableExecute(name, args) && isQuery(sql)) {
+                    return wrapResult(owner.withReconnect(() -> {
+                        Statement current = current();
+                        return Proxies.invoke(current, method, args);
+                    }));
+                }
+                owner.markWrite();
+                try {
+                    return wrapResult(Proxies.invoke(current(), method, args));
+                } catch (SQLException e) {
+                    if (ConnectionWrapper.isExpired(e)) {
+                        owner.sessionExpired();
+                    }
+                    throw e;
+                }
+            }
+            Object result = Proxies.invoke(current(), method, args);
+            remember(method, args);
+            return wrapResult(result);
+        } catch (Throwable t) {
+            JdbcLogger.logException("Statement", name, t);
+            throw t;
+        }
+    }
+
+    private Object invoke(Object proxyRef, String name, Class<?> parameter, Object arg) throws Throwable {
+        Method method = parameter == null ? Statement.class.getMethod(name) : Statement.class.getMethod(name, parameter);
+        return invoke(proxyRef, method, parameter == null ? null : new Object[]{arg});
+    }
+
+    private static boolean isRetryableExecute(String name, Object[] args) {
+        if (!"executeQuery".equals(name) && !"execute".equals(name)) {
+            return false;
+        }
+        // execute()/executeQuery() on a prepared statement, or execute(sql)/executeQuery(sql);
+        // execute(sql, autoGeneratedKeys) and friends are write paths and never retried
+        return Proxies.isNoArg(args) || (args.length == 1 && args[0] instanceof String);
+    }
+
+    /**
+     * The real statement for the connection's current session; re-created (with settings and
+     * parameters replayed) if the connection reconnected since this statement was made.
+     */
+    private synchronized Statement current() throws Throwable {
+        int ownerGeneration = owner.generation();
+        if (generation != ownerGeneration) {
+            Statement stale = real;
+            real = (Statement) Proxies.invoke(owner.real(), factory, factoryArgs);
+            generation = ownerGeneration;
+            for (Map.Entry<String, Object[]> setting : settings.entrySet()) {
+                Proxies.invoke(real, settingMethods.get(setting.getKey()), setting.getValue());
+            }
+            try {
+                stale.close();
+            } catch (SQLException ignored) {
+            }
+        }
+        return real;
+    }
+
+    /**
+     * Record setters (setMaxRows, setFetchSize, setString(1, ...), ...) so a re-created statement
+     * behaves the same. Parameters are keyed by index (or name), so re-binding one replaces it.
+     */
+    private synchronized void remember(Method method, Object[] args) {
+        String name = method.getName();
+        if ("clearParameters".equals(name)) {
+            settings.keySet().removeIf(key -> key.startsWith(PARAMETER_KEY));
+            return;
+        }
+        if (!name.startsWith("set") || Proxies.isNoArg(args)) {
+            return;
+        }
+        String key = args.length >= 2 ? PARAMETER_KEY + args[0] : name;
+        settings.remove(key);
+        settings.put(key, args.clone());
+        settingMethods.put(key, method);
+    }
+
+    private Object wrapResult(Object result) {
+        if (!(result instanceof ResultSet)) {
+            return result;
+        }
+        return new ResultSetDelegate((ResultSet) result) {
+            @Override
+            public Statement getStatement() {
+                return proxy;
+            }
+        };
+    }
+}

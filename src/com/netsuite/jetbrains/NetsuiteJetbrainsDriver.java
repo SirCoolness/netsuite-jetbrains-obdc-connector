@@ -6,6 +6,9 @@ import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Properties;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -19,8 +22,9 @@ import java.util.regex.Pattern;
  * 2. Generates a fresh nonce + timestamp + HMAC-SHA256 signature
  * 3. Delegates to the real OpenAccessDriver with the computed password
  *
- * When GenerateNonce is absent or false, all calls pass through transparently to the
- * original driver with zero overhead.
+ * Without GenerateNonce (or with GenerateNonce=false) the password is passed to the original
+ * driver as is. Either way the connection is wrapped (see ConnectionWrapper) so JetBrains'
+ * generic introspector works and expired sessions are reopened transparently.
  *
  * Usage in JetBrains:
  *   Driver class: com.netsuite.jetbrains.NetsuiteJetbrainsDriver
@@ -30,24 +34,31 @@ import java.util.regex.Pattern;
 public class NetsuiteJetbrainsDriver implements Driver {
 
     private static final String URL_PREFIX = "jdbc:ns:";
+    private static final String STOCK_DRIVER = "com.netsuite.jdbc.openaccess.OpenAccessDriver";
 
-    // Pattern to detect GenerateNonce=true inside CustomProperties(...)
-    // Case-insensitive match within the parenthesized custom properties block
-    private static final Pattern GENERATE_NONCE_PATTERN = Pattern.compile(
-        "CustomProperties\\s*=\\s*\\(([^)]*?)\\)",
-        Pattern.CASE_INSENSITIVE
-    );
+    /** The parenthesized CustomProperties block; group 2 is its content. */
+    private static final Pattern CUSTOM_PROPERTIES = Pattern.compile(
+        "(CustomProperties\\s*=\\s*\\()([^)]*)(\\))", Pattern.CASE_INSENSITIVE);
 
-    private static final Pattern NONCE_FLAG_PATTERN = Pattern.compile(
-        "GenerateNonce\\s*=\\s*true",
-        Pattern.CASE_INSENSITIVE
-    );
+    /** One GenerateNonce entry of the CustomProperties block; group 1 is its value. */
+    private static final Pattern GENERATE_NONCE_ENTRY = Pattern.compile(
+        "\\s*GenerateNonce\\s*=\\s*(.*?)\\s*", Pattern.CASE_INSENSITIVE);
+
+    private static final String[] PASSWORD_KEYS = {"password", "PASSWORD", "Password"};
 
     private final Driver delegate;
 
     static {
         try {
-            DriverManager.registerDriver(new NetsuiteJetbrainsDriver());
+            NetsuiteJetbrainsDriver driver = new NetsuiteJetbrainsDriver();
+            // Loading the stock driver registers it too. Unregister it so DriverManager does not
+            // also offer it the JSON password (a guaranteed failed login per connection).
+            for (Driver registered : Collections.list(DriverManager.getDrivers())) {
+                if (STOCK_DRIVER.equals(registered.getClass().getName())) {
+                    DriverManager.deregisterDriver(registered);
+                }
+            }
+            DriverManager.registerDriver(driver);
         } catch (SQLException e) {
             throw new RuntimeException("Failed to register NetsuiteJetbrainsDriver", e);
         }
@@ -56,7 +67,7 @@ public class NetsuiteJetbrainsDriver implements Driver {
     public NetsuiteJetbrainsDriver() throws SQLException {
         // Instantiate the real NetSuite OpenAccess driver
         try {
-            Class<?> driverClass = Class.forName("com.netsuite.jdbc.openaccess.OpenAccessDriver");
+            Class<?> driverClass = Class.forName(STOCK_DRIVER);
             this.delegate = (Driver) driverClass.getDeclaredConstructor().newInstance();
         } catch (Exception e) {
             throw new SQLException(
@@ -70,25 +81,27 @@ public class NetsuiteJetbrainsDriver implements Driver {
         if (!acceptsURL(url)) {
             return null;
         }
-
-        Connection conn;
-        if (shouldGenerateNonce(url)) {
-            String cleanUrl = stripGenerateNonce(url);
-            Properties modifiedProps = generateNoncePassword(info);
-            if (modifiedProps == null) {
-                return null;
-            }
-            conn = delegate.connect(cleanUrl, modifiedProps);
-        } else {
-            conn = delegate.connect(url, info);
+        JdbcLogger.log("Driver", "connect", new Object[]{url});
+        final String serverUrl = stripGenerateNonce(url);
+        final Properties props = new Properties();
+        if (info != null) {
+            props.putAll(info);
+        }
+        if (!shouldGenerateNonce(url)) {
+            return ConnectionWrapper.wrap(() -> delegate.connect(serverUrl, props));
         }
 
-        // Wrap the connection to normalize catalog names (strip _SB1 sandbox suffixes)
-        // so JetBrains schema patterns work across environments
-        if (conn != null) {
-            conn = ConnectionWrapper.wrap(conn);
+        // Validate the credential JSON up front; each (re)connect then signs a fresh nonce
+        final NonceCredentials credentials = NonceCredentials.fromJson(password(props));
+        for (String key : PASSWORD_KEYS) {
+            props.remove(key);
         }
-        return conn;
+        return ConnectionWrapper.wrap(() -> {
+            Properties signed = new Properties();
+            signed.putAll(props);
+            signed.setProperty("password", NonceGenerator.generatePassword(credentials));
+            return delegate.connect(serverUrl, signed);
+        });
     }
 
     @Override
@@ -98,7 +111,7 @@ public class NetsuiteJetbrainsDriver implements Driver {
 
     @Override
     public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) throws SQLException {
-        return delegate.getPropertyInfo(url, info);
+        return delegate.getPropertyInfo(url == null ? null : stripGenerateNonce(url), info);
     }
 
     @Override
@@ -121,64 +134,58 @@ public class NetsuiteJetbrainsDriver implements Driver {
         return delegate.getParentLogger();
     }
 
+    private static String password(Properties props) {
+        for (String key : PASSWORD_KEYS) {
+            String value = props.getProperty(key);
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
     /**
-     * Check if the URL contains GenerateNonce=true in its CustomProperties block.
+     * True if CustomProperties contains GenerateNonce=true (or 1/yes/on), in any position
+     * and any letter case.
      */
-    private boolean shouldGenerateNonce(String url) {
-        Matcher cpMatcher = GENERATE_NONCE_PATTERN.matcher(url);
-        if (!cpMatcher.find()) {
+    static boolean shouldGenerateNonce(String url) {
+        Matcher block = CUSTOM_PROPERTIES.matcher(url);
+        if (!block.find()) {
             return false;
         }
-        String customProps = cpMatcher.group(1);
-        return NONCE_FLAG_PATTERN.matcher(customProps).find();
+        for (String entry : block.group(2).split(";")) {
+            Matcher m = GENERATE_NONCE_ENTRY.matcher(entry);
+            if (m.matches()) {
+                String value = m.group(1).toLowerCase();
+                return value.equals("true") || value.equals("1") || value.equals("yes") || value.equals("on");
+            }
+        }
+        return false;
     }
 
     /**
-     * Remove GenerateNonce=true (and its trailing/leading semicolons) from CustomProperties
-     * so the real driver doesn't choke on an unknown property.
+     * Remove every GenerateNonce entry from CustomProperties (the server does not know it),
+     * keeping the other entries and their separators intact wherever the flag appeared, and
+     * the whole block if the flag was its only entry.
      */
-    private String stripGenerateNonce(String url) {
-        return url.replaceAll("(?i);?\\s*GenerateNonce\\s*=\\s*true\\s*;?", "")
-                  .replaceAll(";;", ";")
-                  .replaceAll(";\\)", ")");
-    }
-
-    /**
-     * Parse the password as JSON credentials and generate a fresh nonce password.
-     * Returns a new Properties object with the computed password substituted.
-     */
-    private Properties generateNoncePassword(Properties original) throws SQLException {
-        String password = null;
-        if (original != null) {
-            password = original.getProperty("password");
-            if (password == null) {
-                password = original.getProperty("PASSWORD");
-            }
-            if (password == null) {
-                password = original.getProperty("Password");
+    static String stripGenerateNonce(String url) {
+        Matcher block = CUSTOM_PROPERTIES.matcher(url);
+        if (!block.find()) {
+            return url;
+        }
+        List<String> kept = new ArrayList<String>();
+        for (String entry : block.group(2).split(";")) {
+            if (!entry.trim().isEmpty() && !GENERATE_NONCE_ENTRY.matcher(entry).matches()) {
+                kept.add(entry.trim());
             }
         }
-
-        if (password == null || password.trim().isEmpty()) {
-            // JetBrains may open secondary connections without credentials (e.g. for
-            // introspection pooling). Return null to signal caller to abort gracefully.
-            return null;
+        if (!kept.isEmpty()) {
+            return url.substring(0, block.start(2)) + String.join(";", kept) + url.substring(block.end(2));
         }
-
-        NonceCredentials credentials = NonceCredentials.fromJson(password);
-        String noncePassword = NonceGenerator.generatePassword(credentials);
-
-        // Build new properties with the generated password
-        Properties modified = new Properties();
-        if (original != null) {
-            modified.putAll(original);
-        }
-        // Replace all case variants of password with the generated value
-        modified.remove("password");
-        modified.remove("PASSWORD");
-        modified.remove("Password");
-        modified.setProperty("password", noncePassword);
-
-        return modified;
+        // nothing left: drop the whole CustomProperties=() block and its leading separator
+        int start = block.start(1);
+        while (start > 0 && Character.isWhitespace(url.charAt(start - 1))) start--;
+        if (start > 0 && url.charAt(start - 1) == ';') start--;
+        return url.substring(0, start) + url.substring(block.end(3));
     }
 }

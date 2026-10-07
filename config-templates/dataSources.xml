@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Project data source for NetSuite SuiteAnalytics Connect (placeholders only).
+  Goes in <project>/.idea/dataSources.xml (merge the <data-source> element if the file exists).
+  The password is not stored here: set it in the data source dialog (see README.md).
+-->
+<project version="4">
+  <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
+    <data-source source="LOCAL" name="NetSuite" uuid="__DATA_SOURCE_UUID__">
+      <driver-ref>netsuite-tba-wrapper</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>com.netsuite.jetbrains.NetsuiteJetbrainsDriver</jdbc-driver>
+      <jdbc-url>jdbc:ns://__ACCOUNT_HOST__.connect.api.netsuite.com:1708;ServerDataSource=NetSuite2.com;Encrypted=1;NegotiateSSLClose=false;CustomProperties=(AccountID=__ACCOUNT_ID__;RoleID=__ROLE_ID__;GenerateNonce=true)</jdbc-url>
+      <working-dir>$ProjectFileDir$</working-dir>
+    </data-source>
+  </component>
+</project>

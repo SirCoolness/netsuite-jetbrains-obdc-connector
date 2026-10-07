@@ -49,7 +49,9 @@ public class NonceCredentials {
     public static NonceCredentials fromJson(String json) throws SQLException {
         if (json == null || json.trim().isEmpty()) {
             throw new SQLException(
-                "GenerateNonce=true but password is empty. Expected JSON: " + expectedFormat());
+                "GenerateNonce=true but no password was supplied. Set the data source password to the " +
+                "NetSuite token credential JSON and save it (in JetBrains: Save \"Forever\"), so every " +
+                "connection the IDE opens receives it. Expected JSON: " + expectedFormat(), "28000");
         }
 
         json = json.trim();
