@@ -5,20 +5,27 @@ import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
+import java.sql.SQLClientInfoException;
 import java.sql.SQLException;
+import java.sql.SQLWarning;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * Connection proxy that:
  * - returns a {@link MetaDataWrapper} from getMetaData() and wraps every statement in a
  *   {@link StatementWrapper}, so nothing hands JetBrains the raw OpenAccess objects;
  * - strips sandbox suffixes from getCatalog();
+ * - tolerates what the stock driver rejects for benign reasons: unknown client info names
+ *   (it accepts them but leaves a SQLWarning that the IDE shows after Test Connection) and
+ *   network timeouts (unsupported), keeping those values locally;
  * - transparently reconnects (with a fresh nonce) once when NetSuite reports
  *   "Connection expired", for read-only calls, unless the open transaction has written.
  *
@@ -38,7 +45,11 @@ final class ConnectionWrapper implements InvocationHandler {
 
     /** Connection methods that only read state and are safe to repeat after a reconnect. */
     private static final Set<String> RETRYABLE = new HashSet<String>(Arrays.asList(
-        "getCatalog", "getMetaData", "nativeSQL", "getWarnings"));
+        "getCatalog", "getMetaData", "nativeSQL"));
+
+    /** The warning the stock driver leaves for every client info name (JetBrains sets ApplicationName). */
+    private static final Pattern CLIENT_INFO_WARNING = Pattern.compile(
+        "client info name specified is not recognized", Pattern.CASE_INSENSITIVE);
 
     private static final Set<String> STATEMENT_FACTORIES = new HashSet<String>(Arrays.asList(
         "createStatement", "prepareStatement", "prepareCall"));
@@ -59,6 +70,9 @@ final class ConnectionWrapper implements InvocationHandler {
     private int realMetaDataGeneration = -1;
     private String schema;
     private int schemaGeneration = -1;
+    /** Client info as set by the caller; kept here, never replayed onto a new session. */
+    private final Properties clientInfo = new Properties();
+    private volatile int networkTimeout;
 
     private ConnectionWrapper(Connector connector, Connection real) {
         this.connector = connector;
@@ -102,7 +116,9 @@ final class ConnectionWrapper implements InvocationHandler {
 
     public Object invoke(Object proxyRef, Method method, Object[] args) throws Throwable {
         String name = method.getName();
-        JdbcLogger.log("Connection", name, args);
+        // client info values (user and host names) are not logged, only their names
+        JdbcLogger.log("Connection", name, "setClientInfo".equals(name) && args != null && args.length == 2
+            ? new Object[]{args[0], "***"} : args);
         try {
             Object common = Proxies.common(proxyRef, method, args, () -> real);
             if (common != Proxies.UNHANDLED) {
@@ -119,6 +135,24 @@ final class ConnectionWrapper implements InvocationHandler {
             }
             if ("getSchema".equals(name) && Proxies.isNoArg(args)) {
                 return schema();
+            }
+            if ("setClientInfo".equals(name)) {
+                setClientInfo(method, args);
+                return null;
+            }
+            if ("getClientInfo".equals(name)) {
+                return clientInfo(method, args);
+            }
+            if ("setNetworkTimeout".equals(name)) {
+                networkTimeout = (Integer) args[1];
+                tolerate(method, args);
+                return null;
+            }
+            if ("getNetworkTimeout".equals(name)) {
+                return networkTimeout;
+            }
+            if ("getWarnings".equals(name) && Proxies.isNoArg(args)) {
+                return withoutClientInfoWarnings((SQLWarning) withReconnect(() -> real.getWarnings()));
             }
             if ("close".equals(name)) {
                 closed = true;
@@ -152,6 +186,64 @@ final class ConnectionWrapper implements InvocationHandler {
         settings.remove(key);
         settings.put(key, args.clone());
         settingMethods.put(key, method);
+    }
+
+    private synchronized void setClientInfo(Method method, Object[] args) throws Throwable {
+        if (args[0] instanceof Properties) {
+            clientInfo.clear();
+            clientInfo.putAll((Properties) args[0]);
+        } else if (args[1] == null) {
+            clientInfo.remove(args[0]);
+        } else {
+            clientInfo.setProperty((String) args[0], (String) args[1]);
+        }
+        tolerate(method, args);
+    }
+
+    private synchronized Object clientInfo(Method method, Object[] args) throws Throwable {
+        if (args != null && args.length == 1) {
+            String local = clientInfo.getProperty((String) args[0]);
+            return local != null ? local : tolerate(method, args);
+        }
+        Properties all = new Properties();
+        Object server = tolerate(method, args);
+        if (server instanceof Properties) {
+            all.putAll((Properties) server);
+        }
+        all.putAll(clientInfo);
+        return all;
+    }
+
+    /** Call the real connection; a rejection is logged (message only) and answered with null. */
+    private Object tolerate(Method method, Object[] args) throws Throwable {
+        try {
+            return withReconnect(() -> Proxies.invoke(real, method, args));
+        } catch (SQLClientInfoException | java.sql.SQLFeatureNotSupportedException e) {
+            JdbcLogger.write("Connection." + method.getName() + " not supported by the server, ignored: " + e.getMessage());
+            return null;
+        } catch (SQLException e) {
+            if (isExpired(e)) {
+                throw e;
+            }
+            JdbcLogger.write("Connection." + method.getName() + " rejected by the server, ignored: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static SQLWarning withoutClientInfoWarnings(SQLWarning chain) {
+        SQLWarning head = null;
+        for (SQLWarning w = chain; w != null; w = w.getNextWarning()) {
+            if (w.getMessage() != null && CLIENT_INFO_WARNING.matcher(w.getMessage()).find()) {
+                continue;
+            }
+            SQLWarning copy = new SQLWarning(w.getMessage(), w.getSQLState(), w.getErrorCode(), w.getCause());
+            if (head == null) {
+                head = copy;
+            } else {
+                head.setNextWarning(copy);
+            }
+        }
+        return head;
     }
 
     void markWrite() {

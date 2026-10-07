@@ -53,6 +53,9 @@ final class MetaDataWrapper implements InvocationHandler {
         CONSTANTS.put("supportsCatalogsInProcedureCalls", false);
         CONSTANTS.put("supportsCatalogsInIndexDefinitions", false);
         CONSTANTS.put("supportsCatalogsInPrivilegeDefinitions", false);
+        // JDBC 4.0 driver: these throw "Unsupported JDBC 4.0 method"
+        CONSTANTS.put("generatedKeyAlwaysReturned", false);
+        CONSTANTS.put("getRowIdLifetime", java.sql.RowIdLifetime.ROWID_UNSUPPORTED);
     }
     private static final String SYSTEM_TABLE = "SYSTEM TABLE";
 

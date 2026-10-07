@@ -70,6 +70,14 @@ final class StatementWrapper implements InvocationHandler {
             if ("getConnection".equals(name)) {
                 return owner.proxy();
             }
+            // JDBC 4.2 "large" variants the JDBC 4.0 driver lacks (the JDK defaults throw)
+            if ("setLargeMaxRows".equals(name)) {
+                return invoke(proxyRef, "setMaxRows", int.class, (int) Math.min((Long) args[0], Integer.MAX_VALUE));
+            }
+            if ("getLargeMaxRows".equals(name) || "getLargeUpdateCount".equals(name)) {
+                String intVariant = "getLargeMaxRows".equals(name) ? "getMaxRows" : "getUpdateCount";
+                return ((Integer) invoke(proxyRef, intVariant, null, null)).longValue();
+            }
             if ("close".equals(name) || "isClosed".equals(name)) {
                 return Proxies.invoke(real, method, args);
             }
@@ -98,6 +106,11 @@ final class StatementWrapper implements InvocationHandler {
             JdbcLogger.logException("Statement", name, t);
             throw t;
         }
+    }
+
+    private Object invoke(Object proxyRef, String name, Class<?> parameter, Object arg) throws Throwable {
+        Method method = parameter == null ? Statement.class.getMethod(name) : Statement.class.getMethod(name, parameter);
+        return invoke(proxyRef, method, parameter == null ? null : new Object[]{arg});
     }
 
     private static boolean isRetryableExecute(String name, Object[] args) {
